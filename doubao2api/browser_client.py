@@ -118,6 +118,7 @@ class BrowserClient:
 
     async def start(self):
         """Launch browser, navigate to Doubao, init httpx client."""
+        os.environ.setdefault("REBROWSER_PATCHES_RUNTIME_FIX_MODE", "addBinding")
         log.info("Starting BrowserClient (headless=%s)", self.headless)
         self._playwright = await async_playwright().start()
 
@@ -151,10 +152,11 @@ class BrowserClient:
         stealth = Stealth(navigator_languages_override=("zh-CN", "zh"))
         await stealth.apply_stealth_async(self._page)
 
-        # Navigate
-        log.info("Navigating to %s", CHAT_URL)
-        await self._page.goto(CHAT_URL, wait_until="load", timeout=60000)
-        await asyncio.sleep(3)
+        # Navigate：優先會話池第一個會話（URL 帶 ID，前端才完整引導，不新建會話）
+        target = self._chat_target()
+        log.info("Navigating to %s", target)
+        await self._page.goto(target, wait_until="load", timeout=60000)
+        await self._wait_for_conversation_url()
 
         # httpx 直連頭與真實瀏覽器 UA 對齊（playwright 升級後自動跟隨）
         try:
@@ -163,8 +165,9 @@ class BrowserClient:
         except Exception:
             self._ua = BROWSER_UA
 
-        # Init httpx
-        self._http = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=10))
+        # Init curl_cffi：impersonate="chrome" 偽裝 Chrome TLS 指紋（httpx JA3 會暴露直連流量）
+        from curl_cffi.requests import AsyncSession
+        self._http = AsyncSession(impersonate="chrome", timeout=180)
 
         await self._check_login_state()
 
@@ -188,7 +191,8 @@ class BrowserClient:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
         if self._http:
-            await self._http.aclose()
+            # curl_cffi 0.13 的 AsyncSession 異步關閉是 close()（無 aclose）
+            await self._http.close()
             self._http = None
         if self._context:
             try:
@@ -781,18 +785,10 @@ class BrowserClient:
             await asyncio.sleep(1)
         async with self._ui_sync_lock:
             try:
-                # 優先直接進會話池第一個會話：頁面 URL 帶會話 ID（豆包前端才會完整引導），
-                # 也讓 www.doubao.com/chat 的 UI 停在真實對話裡
-                pool = [c.strip() for c in
-                        os.environ.get("DOUBAO_IMAGE_CONV_IDS", "").split(",") if c.strip()]
-                target = CHAT_URL + pool[0] if pool else CHAT_URL
+                target = self._chat_target()
                 log.info("UI sync: reloading chat page -> %s", target)
                 await self._page.goto(target, wait_until="load", timeout=60000)
-                # 等前端把地址落到具體會話 /chat/<id>（最多 12s）
-                for _ in range(12):
-                    if re.search(r"/chat/\d+", self._page.url):
-                        break
-                    await asyncio.sleep(1)
+                await self._wait_for_conversation_url()
                 await self._extract_params()
                 await self._seed_ms_token()
                 await self._verify_fetch_hook()
@@ -801,6 +797,20 @@ class BrowserClient:
             except Exception as e:  # noqa: BLE001 — UI 刷新失敗不影響 API 能力
                 log.warning("UI sync failed: %s", e)
                 return {"status": "error", "message": str(e)[:200]}
+
+    def _chat_target(self) -> str:
+        """聊天頁目標地址：優先會話池第一個會話（URL 帶 ID，前端才完整引導，
+        且不會新建會話）；池未配置時退回裸 /chat/。"""
+        pool = [c.strip() for c in
+                os.environ.get("DOUBAO_IMAGE_CONV_IDS", "").split(",") if c.strip()]
+        return CHAT_URL + pool[0] if pool else CHAT_URL
+
+    async def _wait_for_conversation_url(self, timeout_s: int = 12):
+        """等前端把地址落到具體會話 /chat/<id>。"""
+        for _ in range(timeout_s):
+            if re.search(r"/chat/\d+", self._page.url):
+                break
+            await asyncio.sleep(1)
 
     # ------------------------------------------------------------------
     # SSE parsing helpers
@@ -1598,7 +1608,7 @@ class BrowserClient:
         tos_host = upload_hosts[0] if upload_hosts else "tos-mya2lf.vodupload.com"
         upload_url = f"https://{tos_host}/upload/v1/{store_uri}"
         resp = await self._http.post(
-            upload_url, content=file_data,
+            upload_url, data=file_data,
             headers={"Authorization": tos_auth, "Content-CRC32": crc32},
             timeout=120,
         )
@@ -1616,7 +1626,7 @@ class BrowserClient:
         sign_h2 = _aws_sign_v4("POST", commit_url, commit_body)
         sign_h2["Content-Type"] = "application/json"
         sign_h2["Cookie"] = cookie_str
-        resp = await self._http.post(commit_url, content=commit_body, headers=sign_h2, timeout=30)
+        resp = await self._http.post(commit_url, data=commit_body, headers=sign_h2, timeout=30)
         body = resp.json()
         results = body.get("Result", {}).get("Results", [])
         if not results or results[0].get("UriStatus") != 2000:
