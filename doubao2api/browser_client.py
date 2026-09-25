@@ -17,13 +17,14 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import AsyncGenerator, Optional, Dict, Any, List
 from urllib.parse import urlencode
 
 import httpx
-from patchright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
 
 from .humanize import Humanizer
@@ -780,9 +781,18 @@ class BrowserClient:
             await asyncio.sleep(1)
         async with self._ui_sync_lock:
             try:
-                log.info("UI sync: reloading chat page")
-                await self._page.goto(CHAT_URL, wait_until="load", timeout=60000)
-                await asyncio.sleep(3)
+                # 優先直接進會話池第一個會話：頁面 URL 帶會話 ID（豆包前端才會完整引導），
+                # 也讓 www.doubao.com/chat 的 UI 停在真實對話裡
+                pool = [c.strip() for c in
+                        os.environ.get("DOUBAO_IMAGE_CONV_IDS", "").split(",") if c.strip()]
+                target = CHAT_URL + pool[0] if pool else CHAT_URL
+                log.info("UI sync: reloading chat page -> %s", target)
+                await self._page.goto(target, wait_until="load", timeout=60000)
+                # 等前端把地址落到具體會話 /chat/<id>（最多 12s）
+                for _ in range(12):
+                    if re.search(r"/chat/\d+", self._page.url):
+                        break
+                    await asyncio.sleep(1)
                 await self._extract_params()
                 await self._seed_ms_token()
                 await self._verify_fetch_hook()

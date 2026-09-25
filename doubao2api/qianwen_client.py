@@ -22,7 +22,7 @@ import time
 import uuid
 from typing import AsyncGenerator, Optional, Dict, Any
 
-from patchright.async_api import async_playwright, BrowserContext, Page
+from playwright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
 
 log = logging.getLogger(__name__)
