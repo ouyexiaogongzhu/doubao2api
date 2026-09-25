@@ -157,6 +157,7 @@ class BrowserClient:
         log.info("Navigating to %s", target)
         await self._page.goto(target, wait_until="load", timeout=60000)
         await self._wait_for_conversation_url()
+        await self._enter_pool_conversation()
 
         # httpx 直連頭與真實瀏覽器 UA 對齊（playwright 升級後自動跟隨）
         try:
@@ -789,6 +790,7 @@ class BrowserClient:
                 log.info("UI sync: reloading chat page -> %s", target)
                 await self._page.goto(target, wait_until="load", timeout=60000)
                 await self._wait_for_conversation_url()
+                await self._enter_pool_conversation()
                 await self._extract_params()
                 await self._seed_ms_token()
                 await self._verify_fetch_hook()
@@ -799,18 +801,39 @@ class BrowserClient:
                 return {"status": "error", "message": str(e)[:200]}
 
     def _chat_target(self) -> str:
-        """聊天頁目標地址：優先會話池第一個會話（URL 帶 ID，前端才完整引導，
-        且不會新建會話）；池未配置時退回裸 /chat/。"""
-        pool = [c.strip() for c in
-                os.environ.get("DOUBAO_IMAGE_CONV_IDS", "").split(",") if c.strip()]
-        return CHAT_URL + pool[0] if pool else CHAT_URL
+        """聊天頁入口：從裸 /chat/ 進入，讓前端自行跳轉到會話。
 
-    async def _wait_for_conversation_url(self, timeout_s: int = 12):
+        實測深鏈直達 /chat/<id> 時 SPA 不會往 window 注入 bdms（上傳簽名失敗），
+        從 /chat/ 正常進入才會。落地等 _wait_for_conversation_url 完成。
+        """
+        return CHAT_URL
+
+    async def _wait_for_conversation_url(self, timeout_s: int = 25):
         """等前端把地址落到具體會話 /chat/<id>。"""
         for _ in range(timeout_s):
             if re.search(r"/chat/\d+", self._page.url):
                 break
             await asyncio.sleep(1)
+
+    async def _enter_pool_conversation(self):
+        """側邊欄點擊進入會話池第一個會話（SPA 路由：不重載頁面、不丟 bdms）。"""
+        pool = [c.strip() for c in
+                os.environ.get("DOUBAO_IMAGE_CONV_IDS", "").split(",") if c.strip()]
+        if not pool or re.search(r"/chat/\d+", self._page.url):
+            return
+        cid = pool[0]
+        try:
+            for sel in (f"a[href='/chat/{cid}']", f"[href*='{cid}']"):
+                loc = self._page.locator(sel).first
+                try:
+                    await loc.wait_for(state="visible", timeout=6000)
+                    await loc.click()
+                    break
+                except Exception:
+                    continue
+            await self._wait_for_conversation_url(10)
+        except Exception as e:  # noqa: BLE001 — 找不到側邊欄項就停在 /chat/，不影響 API
+            log.warning("enter pool conversation failed: %s", str(e)[:120])
 
     # ------------------------------------------------------------------
     # SSE parsing helpers
@@ -1688,11 +1711,13 @@ class BrowserClient:
         cookie_str = await self._get_cookies_string()
         headers = self._build_headers(cookie_str)
         headers.pop("Content-Type", None)
-        files = {
-            "data": (filename, image_bytes, f"image/{ext}"),
-            "file_type": (None, ext),
-        }
-        resp = await self._http.post(signed_url, headers=headers, files=files, timeout=60)
+        # curl_cffi 0.13 不支持 files=，用 CurlMime（multipart）
+        from curl_cffi import CurlMime
+        mime = CurlMime()
+        mime.addpart(name="data", filename=filename,
+                     content_type=f"image/{ext}", data=image_bytes)
+        mime.addpart(name="file_type", content_type="text/plain", data=ext)
+        resp = await self._http.post(signed_url, headers=headers, multipart=mime, timeout=60)
         if resp.status_code != 200:
             raise RuntimeError(f"Image upload failed ({resp.status_code}): {resp.text[:500]}")
         body = resp.json()
