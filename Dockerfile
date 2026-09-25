@@ -4,6 +4,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir aiohttp fastapi pydantic uvicorn httpx playwright playwright-stealth python-multipart
+RUN playwright install --with-deps chromium
 
 COPY doubao2api/ doubao2api/
 

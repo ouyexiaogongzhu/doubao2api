@@ -13,8 +13,10 @@ and call this signing function. All actual API traffic goes through httpx.
 """
 
 import asyncio
+import base64
 import json
 import logging
+import os
 import time
 import uuid
 from typing import AsyncGenerator, Optional, Dict, Any, List
@@ -31,6 +33,14 @@ CHAT_URL = f"{DOUBAO_URL}/chat/"
 COMPLETION_URL = f"{DOUBAO_URL}/chat/completion"
 SAMANTHA_COMPLETION_URL = f"{DOUBAO_URL}/samantha/chat/completion"
 DEFAULT_BOT_ID = "7338286299411103781"
+
+# 指紋統一：本機真實身份（macOS + 系統 Google Chrome 實際版本，channel="chrome"）。
+# 瀏覽器上下文不再覆蓋 UA（用真 Chrome 自己的）；此常量僅供 httpx 直連頭兜底，
+# 線上 UA 為 Chrome 凍結版號（見 qr_login.CHROME_VERSION）。
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+)
 
 
 class BrowserClient:
@@ -56,6 +66,9 @@ class BrowserClient:
         # Stream bridge: request_id -> asyncio.Queue for SSE chunks
         self._stream_queues: Dict[str, asyncio.Queue] = {}
         self._bridge_ready: bool = False
+        self._last_activity: float = 0.0  # monotonic；refresh_ui 等它安静后再刷新
+        self._ui_sync_lock = asyncio.Lock()
+        self._dl_page: Optional[Page] = None  # 圖片下載專用後台標籤頁
 
     @property
     def is_ready(self) -> bool:
@@ -114,17 +127,18 @@ class BrowserClient:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 self.user_data_dir,
                 headless=self.headless,
+                channel="chrome",  # 系統安裝的 Google Chrome（真實消費版，非 Chrome for Testing）
                 args=launch_args,
-                viewport={"width": 1280, "height": 720},
+                viewport=None,
                 locale="zh-CN",
             )
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         else:
             browser = await self._playwright.chromium.launch(
-                headless=self.headless, args=launch_args,
+                headless=self.headless, channel="chrome", args=launch_args,
             )
             self._context = await browser.new_context(
-                viewport={"width": 1280, "height": 720}, locale="zh-CN",
+                viewport=None, locale="zh-CN",
             )
             self._page = await self._context.new_page()
 
@@ -136,6 +150,13 @@ class BrowserClient:
         log.info("Navigating to %s", CHAT_URL)
         await self._page.goto(CHAT_URL, wait_until="load", timeout=60000)
         await asyncio.sleep(3)
+
+        # httpx 直連頭與真實瀏覽器 UA 對齊（playwright 升級後自動跟隨）
+        try:
+            self._ua = await self._page.evaluate("navigator.userAgent") or BROWSER_UA
+            log.info("Browser UA: %s", self._ua)
+        except Exception:
+            self._ua = BROWSER_UA
 
         # Init httpx
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=10))
@@ -450,10 +471,7 @@ class BrowserClient:
             "Cookie": cookie_str,
             "Origin": DOUBAO_URL,
             "Referer": CHAT_URL,
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": getattr(self, "_ua", BROWSER_UA),
             "agw-js-conv": "str, str",
         }
         if csrf_token:
@@ -474,6 +492,7 @@ class BrowserClient:
         """Send a chat message and yield SSE events via in-browser fetch."""
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
+        self._last_activity = time.monotonic()
 
         need_create = conversation_id is None or conversation_id == ""
         effective_bot_id = bot_id or DEFAULT_BOT_ID
@@ -594,6 +613,7 @@ class BrowserClient:
             log.error("Stream timeout (180s) for request %s", request_id)
             yield {"error": True, "status": 0, "body": "Stream timeout"}
         finally:
+            self._last_activity = time.monotonic()
             self._stream_queues.pop(request_id, None)
             if not eval_task.done():
                 eval_task.cancel()
@@ -716,6 +736,39 @@ class BrowserClient:
             full_text += self._extract_text(event)
 
         return {"text": full_text, "conversation_id": result_conv_id}
+
+    def mark_activity(self) -> None:
+        """請求入口打點：讓 refresh_ui 的安靜窗口涵蓋 handler 抖動期，避免重載競態。"""
+        self._last_activity = time.monotonic()
+
+    async def refresh_ui(
+        self, quiet_s: float = 8.0, timeout_s: float = 90.0
+    ) -> Dict[str, Any]:
+        """等請求安靜後重載聊天頁，讓 www.doubao.com/chat 渲染出 API 產生的消息。
+
+        API 走 in-browser fetch 直連，不經前端狀態，UI 不會實時顯示；
+        重載後由服務端會話歷史渲染。fetch 鉤子/簽名橋在頁面重載後重新就緒。
+        """
+        if not self.is_ready or not self._page:
+            return {"status": "error", "message": "not ready"}
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() - self._last_activity < quiet_s:
+            if time.monotonic() > deadline:
+                return {"status": "skipped", "message": "requests still active"}
+            await asyncio.sleep(1)
+        async with self._ui_sync_lock:
+            try:
+                log.info("UI sync: reloading chat page")
+                await self._page.goto(CHAT_URL, wait_until="load", timeout=60000)
+                await asyncio.sleep(3)
+                await self._extract_params()
+                await self._seed_ms_token()
+                await self._verify_fetch_hook()
+                log.info("UI sync done: %s", self._page.url)
+                return {"status": "ok", "url": self._page.url}
+            except Exception as e:  # noqa: BLE001 — UI 刷新失敗不影響 API 能力
+                log.warning("UI sync failed: %s", e)
+                return {"status": "error", "message": str(e)[:200]}
 
     # ------------------------------------------------------------------
     # SSE parsing helpers
@@ -871,6 +924,7 @@ class BrowserClient:
         prompt: str,
         ratio: Optional[str] = None,
         ref_image_key: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate images using /samantha/chat/completion.
 
@@ -878,10 +932,14 @@ class BrowserClient:
             prompt: Text description of the image to generate.
             ratio: Aspect ratio ("1:1", "16:9", "9:16", "4:3", "3:4").
             ref_image_key: Optional uploaded image key for reference.
+            conversation_id: Reuse an image conversation when set (行為風控：
+                每次都 conv=new 是典型機器人畫像；真人在一個會話裡連續生圖).
 
         Returns:
-            Dict with 'images' list, each having url/width/height/key.
+            Dict with 'images' list, each having url/width/height/key,
+            plus 'conversation_id' for sticky reuse.
         """
+        self._last_activity = time.monotonic()
         content_data: Dict[str, Any] = {"text": prompt}
         if ratio:
             content_data["ratio"] = ratio
@@ -904,13 +962,14 @@ class BrowserClient:
                 {"type": "image", "key": ref_image_key,
                  "extra": {"refer_types": "overall"}}
             ]
+        self._last_activity = time.monotonic()
 
         payload = {
             "messages": [message],
             "completion_option": {
                 "is_regen": False,
                 "with_suggest": True,
-                "need_create_conversation": True,
+                "need_create_conversation": not conversation_id,
                 "launch_stage": 1,
                 "is_replace": False,
                 "is_delete": False,
@@ -927,18 +986,33 @@ class BrowserClient:
             "local_conversation_id": str(uuid.uuid4()),
             "local_message_id": str(uuid.uuid4()),
         }
+        if conversation_id:
+            payload["conversation_id"] = conversation_id
 
-        log.info("generate_image: prompt=%s, ratio=%s", prompt[:50], ratio)
+        log.info("generate_image: prompt=%s, ratio=%s, conv=%s", prompt[:50], ratio,
+                 conversation_id or "new")
         raw = await self._samantha_request(payload, timeout=120)
 
         # Parse response - look for content_type=2010 (image output)
-        images = []
+        images: List[Dict[str, Any]] = []
+        conv_id = ""
         for data in self._parse_samantha_sse(raw):
             et = data.get("event_type")
             if et == 2005:
                 detail = data.get("event_data", "")
                 raise RuntimeError(f"generate_image error: {str(detail)[:500]}")
             if et != 2001:
+                # 事件信封本身也可能带会话 id（ack 等）
+                if not conv_id:
+                    ed0 = data.get("event_data")
+                    if isinstance(ed0, str):
+                        try:
+                            ed0 = json.loads(ed0)
+                        except json.JSONDecodeError:
+                            ed0 = {}
+                    conv_id = (data.get("conversation_id")
+                               or (ed0 or {}).get("conversation_id")
+                               or "")
                 continue
 
             ed = data.get("event_data", {})
@@ -954,6 +1028,12 @@ class BrowserClient:
                     msg = json.loads(msg)
                 except json.JSONDecodeError:
                     continue
+
+            if not conv_id:
+                conv_id = (msg.get("conversation_id")
+                           or ed.get("conversation_id")
+                           or data.get("conversation_id")
+                           or "")
 
             if msg.get("content_type") != 2010:
                 continue
@@ -981,8 +1061,46 @@ class BrowserClient:
                     "format": ori.get("format") or thumb.get("format", ""),
                 })
 
-        log.info("generate_image: got %d images", len(images))
-        return {"images": images, "prompt": prompt}
+        log.info("generate_image: got %d images, conv=%s", len(images),
+                 conv_id or "<extract-failed>")
+
+        # 用瀏覽器原生 fetch 抓回圖片（真實 Chrome TLS/cookie，避免非瀏覽器下載觸發風控），
+        # 存本地並附 b64_json —— 下游（網關/影策）直接用 b64，沒人再碰 byteimg。
+        dl_dir = os.environ.get("DOUBAO_DOWNLOAD_DIR") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "downloads")
+        os.makedirs(dl_dir, exist_ok=True)
+        for i, img in enumerate(images):
+            raw = await self._browser_fetch_bytes(img["url"])
+            if not raw:
+                log.warning("browser fetch failed for %s, keep remote url", img["url"][:60])
+                continue
+            img["b64_json"] = base64.b64encode(raw).decode()
+            ext = (img.get("format") or "png").lower()
+            path = os.path.join(dl_dir, f"img_{int(time.time()*1000)}_{i}.{ext}")
+            with open(path, "wb") as f:
+                f.write(raw)
+            img["local_path"] = path
+
+        self._last_activity = time.monotonic()
+        return {"images": images, "prompt": prompt, "conversation_id": conv_id}
+
+    async def _browser_fetch_bytes(self, url: str) -> Optional[bytes]:
+        """用瀏覽器原生導航抓圖：頂級導航無 CORS，真實 Chrome 網絡棧 + cookie。
+
+        用專用後台標籤頁（頁面自身就是圖片 origin），Playwright 從導航響應取字節。
+        """
+        try:
+            if self._dl_page is None:
+                self._dl_page = await self._context.new_page()
+            resp = await self._dl_page.goto(url, wait_until="commit", timeout=60000)
+            if resp is None or resp.status != 200:
+                log.warning("browser download status=%s", resp.status if resp else "none")
+                return None
+            body = await resp.body()
+            return bytes(body) or None
+        except Exception as e:  # noqa: BLE001 — 失敗則退回遠端 url，由調用方兜底
+            log.warning("browser download error: %s", str(e)[:150])
+            return None
 
     async def generate_music(
         self,

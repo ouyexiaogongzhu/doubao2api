@@ -21,6 +21,12 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 import aiohttp
 
 from .qr_login import CHROME_VERSION, CHROMIUM_BUILD
+
+# 与真实浏览器（browser_client 的 Playwright Chromium）一致的 UA —— 本機 macOS + 真實版本
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    f"(KHTML, like Gecko) Chrome/{CHROME_VERSION} Safari/537.36"
+)
 from .sse import iter_sse_events
 
 log = logging.getLogger(__name__)
@@ -377,11 +383,7 @@ class DoubaoChatClient:
             timeout=self.timeout,
             read_bufsize=2**20,  # 1MB; default 64KB causes "Chunk too big" for long SSE lines
             headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    f"Chrome/{CHROME_VERSION} Safari/537.36"
-                ),
+                "User-Agent": UA,
                 "Content-Type": "application/json",
                 "Origin": "https://www.doubao.com",
                 "Referer": "https://www.doubao.com/chat",
@@ -2192,11 +2194,7 @@ class DoubaoChatClient:
 
         # 独立 session: 避免 self.session 默认 Content-Type: application/json 覆盖 multipart
         upload_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/135.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": UA,
             "Origin": "https://www.doubao.com",
             "Referer": "https://www.doubao.com/chat",
             "x-tt-passport-csrf-token": (

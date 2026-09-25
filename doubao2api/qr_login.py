@@ -14,6 +14,8 @@ Flow:
 """
 
 import base64
+
+from .browser_client import BROWSER_UA
 import json
 import logging
 import random
@@ -34,14 +36,16 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://www.doubao.com"
 AID = 497858
 
-# Current Chrome version — keep in sync with client.py UA
-CHROME_VERSION = "148.0.0.0"
-CHROMIUM_BUILD = "148.0.7816.0"  # used by client.py _security_params
+# Chrome 版本 — 与系统安装的 Google Chrome 对齐（browser_client 用 channel="chrome"）。
+# 线上 UA 走 Chrome 冻结版号（153.0.0.0）；CHROMIUM_BUILD 保留完整 build
+# （client.py _security_params 的 chromium_version 参数用完整版本）。
+# Chrome 升级后用 `Google\ Chrome --version` 重新核对。
+CHROME_VERSION = "153.0.0.0"
+CHROMIUM_BUILD = "153.0.8010.53"
 
 BASE_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        f"(KHTML, like Gecko) Chrome/{CHROME_VERSION} Safari/537.36"
+        BROWSER_UA
     ),
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.doubao.com/chat/login",

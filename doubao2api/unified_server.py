@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import itertools
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -328,6 +330,31 @@ def create_app(
 
     bucket = _TokenBucket(rpm_limit)
 
+    # ── 黏性對話：同模型複用最後一個 conversation_id，避免每次調用開新對話 ──
+    _STICKY_CONV: Dict[str, str] = {}
+
+    def _sticky_cid(model: str, requested: Optional[str]) -> Optional[str]:
+        if requested:
+            return requested
+        if os.environ.get("DOUBAO_STICKY_CONVERSATION", "").strip() == "1":
+            return _STICKY_CONV.get(model) or None
+        return None
+
+    def _remember_cid(model: str, cid: Optional[str]) -> None:
+        if os.environ.get("DOUBAO_STICKY_CONVERSATION", "").strip() == "1" and cid:
+            _STICKY_CONV[model] = cid
+
+    # ── 圖片會話池：輪轉復用指定會話，避免每次 conv=new 觸發風控 ──
+    # DOUBAO_IMAGE_CONV_IDS="id1,id2,..."（launchd plist 注入）
+    _IMAGE_CONV_POOL = [c.strip() for c in
+                        os.environ.get("DOUBAO_IMAGE_CONV_IDS", "").split(",") if c.strip()]
+    _image_conv_cycle = itertools.cycle(_IMAGE_CONV_POOL) if _IMAGE_CONV_POOL else None
+
+    def _next_image_cid() -> Optional[str]:
+        if _image_conv_cycle is not None:
+            return next(_image_conv_cycle)
+        return _sticky_cid("doubao-image", None)
+
     # ── Auth helper ──
 
     def _check_auth(request: Request) -> None:
@@ -540,6 +567,9 @@ def create_app(
 
         await bucket.acquire()
         client = _get_client()
+        # 行為風控：人類不會勻速連發；隨機抖動打散請求節奏（打點在前，防 refresh_ui 競態）
+        client.mark_activity()
+        await asyncio.sleep(random.uniform(1.0, 3.0))
         request_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
         if body.stream:
@@ -552,7 +582,7 @@ def create_app(
                     )
             return StreamingResponse(
                 _stream_chat(client, prompt, use_deep_think, request_id, model_name,
-                             conversation_id=body.conversation_id, bot_id=body.bot_id,
+                             conversation_id=_sticky_cid(body.model, body.conversation_id), bot_id=body.bot_id,
                              has_tools=has_tools,
                              messages_for_counting=body.messages),
                 media_type="text/event-stream",
@@ -565,7 +595,7 @@ def create_app(
                 # Tool calling non-streaming path
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
-                    conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    conversation_id=_sticky_cid(body.model, body.conversation_id), bot_id=body.bot_id,
                 )
                 # Report to expert tracker (detect silent downgrade)
                 had_reasoning = bool(message.get("reasoning_content"))
@@ -597,11 +627,12 @@ def create_app(
             else:
                 message = await _collect_chat_response(
                     client, prompt, use_deep_think,
-                    conversation_id=body.conversation_id, bot_id=body.bot_id,
+                    conversation_id=_sticky_cid(body.model, body.conversation_id), bot_id=body.bot_id,
                 )
                 finish_reason = "stop"
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
+        asyncio.create_task(client.refresh_ui())
 
         # max_tokens truncation (non-streaming only)
         content = message.get("content") or ""
@@ -637,6 +668,7 @@ def create_app(
         }
         if message.get("conversation_id"):
             resp_data["conversation_id"] = message["conversation_id"]
+            _remember_cid(body.model, message["conversation_id"])
         return JSONResponse(resp_data)
 
     # ------------------------------------------------------------------
@@ -955,30 +987,50 @@ def create_app(
         _check_auth(request)
         await bucket.acquire()
         client = _get_client()
+        # 行為風控：人類不會勻速連發；隨機抖動打散請求節奏（打點在前，防 refresh_ui 競態）
+        client.mark_activity()
+        await asyncio.sleep(random.uniform(2.0, 6.0))
 
         ratio = body.ratio or _size_to_ratio(body.size)
 
-        try:
-            result = await client.generate_image(
-                prompt=body.prompt,
-                ratio=ratio,
-                ref_image_key=body.ref_image_key,
-            )
-        except RuntimeError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
+        result = None
+        for attempt in (1, 2):
+            client.mark_activity()
+            try:
+                result = await client.generate_image(
+                    prompt=body.prompt,
+                    ratio=ratio,
+                    ref_image_key=body.ref_image_key,
+                    conversation_id=_next_image_cid(),
+                )
+            except Exception as exc:  # RuntimeError + Playwright 导航竞态等
+                if attempt == 1:
+                    await asyncio.sleep(random.uniform(3.0, 6.0))
+                    continue
+                raise HTTPException(status_code=502, detail=str(exc)[:300])
+            if result.get("images"):
+                break
+            if attempt == 1:
+                # 页面重载后首请求 msToken 未热，samantha 可能静默空返回 —— 重试一次
+                await asyncio.sleep(random.uniform(3.0, 6.0))
 
         images = result.get("images", [])
         if not images:
             raise HTTPException(
                 status_code=502, detail="No images generated"
             )
+        # UI 同步：重載頁面讓 www.doubao.com/chat 顯示剛才的生圖會話
+        asyncio.create_task(client.refresh_ui())
 
         data = []
         for img in images:
-            data.append({
+            item = {
                 "url": img["url"],
                 "revised_prompt": body.prompt,
-            })
+            }
+            if img.get("b64_json"):
+                item["b64_json"] = img["b64_json"]  # 瀏覽器原生抓回，下游免下載 byteimg
+            data.append(item)
 
         return JSONResponse({
             "created": int(time.time()),
@@ -1595,6 +1647,8 @@ def create_app(
 
         # Final chunk with usage
         client.record_success()
+        # UI 同步：重載頁面讓 www.doubao.com/chat 顯示剛才的對話（fetch 直連不經前端）
+        asyncio.create_task(client.refresh_ui())
         # Report to expert tracker for degradation detection
         if has_tools and use_deep_think >= 1:
             _expert_tracker.report_response(had_reasoning_content)
@@ -1707,6 +1761,15 @@ def create_app(
             return JSONResponse({"status": "healthy", "ms": ms, "response": content[:100]})
         except Exception as e:
             return JSONResponse({"status": "error", "message": str(e)[:200]})
+
+    @app.get("/admin/api/sync-ui")
+    async def admin_sync_ui(request: Request):
+        """手動觸發：重載聊天頁讓 UI 顯示 API 產生的會話（會等當前請求安靜）。"""
+        _check_auth(request)
+        client = _browser.get("client")
+        if client is None:
+            raise HTTPException(status_code=503, detail="Browser not initialized")
+        return await client.refresh_ui()
 
     @app.post("/auth/login")
     async def auth_login(request: Request):
