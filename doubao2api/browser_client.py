@@ -23,8 +23,10 @@ from typing import AsyncGenerator, Optional, Dict, Any, List
 from urllib.parse import urlencode
 
 import httpx
-from playwright.async_api import async_playwright, BrowserContext, Page
+from patchright.async_api import async_playwright, BrowserContext, Page
 from playwright_stealth import Stealth
+
+from .humanize import Humanizer
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +71,8 @@ class BrowserClient:
         self._last_activity: float = 0.0  # monotonic；refresh_ui 等它安静后再刷新
         self._ui_sync_lock = asyncio.Lock()
         self._dl_page: Optional[Page] = None  # 圖片下載專用後台標籤頁
+        self._humanizer = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     @property
     def is_ready(self) -> bool:
@@ -163,8 +167,25 @@ class BrowserClient:
 
         await self._check_login_state()
 
+        # 行為模擬：預熱一次 + 心跳常駐，讓頁面持續產生新鮮 msToken/交互遙測
+        self._humanizer = Humanizer(self._page)
+        await self._humanizer.warm_up()
+        self._heartbeat_task = asyncio.create_task(self._humanizer.heartbeat_loop())
+
+    async def _human_nudge(self):
+        """請求前輕交互（合成鼠標事件，不影響真實光標）；失敗靜默。"""
+        if self._humanizer is None:
+            return
+        try:
+            await self._humanizer.nudge()
+        except Exception:  # noqa: BLE001
+            pass
+
     async def stop(self):
         """Close browser and httpx client."""
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
         if self._http:
             await self._http.aclose()
             self._http = None
@@ -493,6 +514,7 @@ class BrowserClient:
         if not self._ready:
             raise RuntimeError("Browser not ready - need login first")
         self._last_activity = time.monotonic()
+        await self._human_nudge()
 
         need_create = conversation_id is None or conversation_id == ""
         effective_bot_id = bot_id or DEFAULT_BOT_ID
@@ -940,6 +962,7 @@ class BrowserClient:
             plus 'conversation_id' for sticky reuse.
         """
         self._last_activity = time.monotonic()
+        await self._human_nudge()
         content_data: Dict[str, Any] = {"text": prompt}
         if ratio:
             content_data["ratio"] = ratio
